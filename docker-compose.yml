@@ -28,13 +28,3 @@ services:
     image: redis:6.2.1
     command: redis-server --requirepass ${REDIS_PASSWORD}
     restart: always
-
-  db_postgres:
-    image: postgres:13
-    env_file:
-      - .env_dev
-    healthcheck:
-      test: [ "CMD", "pg_isready" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
