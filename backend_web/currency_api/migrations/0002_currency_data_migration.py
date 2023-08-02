@@ -1,6 +1,7 @@
-from django.db import migrations
+from django.db import migrations, transaction
 
 
+@transaction.atomic
 def create_initial_currencies(apps, schema_editor):
     currency_model = apps.get_model('currency_api', 'Currency')
 

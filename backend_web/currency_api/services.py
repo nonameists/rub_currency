@@ -1,13 +1,18 @@
 from datetime import datetime
-from typing import Set, Optional
+from typing import Set, Optional, Dict
 
 import requests
+from django.core.cache import cache
+from django.db.models.query import QuerySet
 from django.utils import timezone
+from requests import HTTPError, Request
+
+from backend.settings import CURRENCY_ARCHIVE_URL, MAIN_CURRENCY, CURRENCY_URL
+from currency_api.exceptions import DateNotFoundException
+from currency_api.models import ExchangeRate
 
 
 class CurrencyService:
-    CURRENCY_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
-    CURRENCY_ARCHIVE_URL = "https://www.cbr-xml-daily.ru/archive/{YEAR}/{MONTH}/{DAY}/daily_json.js"
 
     def __init__(self, currencies: Set[str], date: Optional[str]):
         self.currencies = currencies
@@ -16,39 +21,105 @@ class CurrencyService:
         else:
             self.date = date
 
-    def get_rates(self):
-        return self._get_data_from_source()
-
-    def _get_data_from_source(self):
-        result = {
+        self.result: Dict = {
             'date': self.date,
             "currencies": []
         }
-        is_archive = self._is_date_archive(self.date)
+
+    def get_rates(self) -> Dict:
+        """Public method to get currency rates."""
+        is_archive: bool = self._is_date_archive()
         if is_archive:
-            year, month, day = self.date.split('-')
-            url = self.CURRENCY_ARCHIVE_URL.format(YEAR=year, MONTH=month, DAY=day)
-        else:
-            url = self.CURRENCY_URL
+            return self._get_data_from_archive()
+        is_future: bool = self._is_date_future()
+        if is_future:
+            return self.result
 
+        return self._get_data_from_db()
+
+    def _get_data_from_db(self) -> Dict:
+        """Private method to fetch rates from db."""
+        cached_rates = self._get_data_from_cache()
+        if cached_rates:
+            return cached_rates
+
+        rates: QuerySet = ExchangeRate.objects.filter(
+            currency_from__name=MAIN_CURRENCY, currency_to__name__in=self.currencies, date=self.date
+        ).values('currency_to__name', 'rate')
+
+        if not rates:
+            self._get_data_from_source()
+        for rate_item in rates:
+            self.result['currencies'].append(
+                {'name': rate_item['currency_to__name'], 'rate': rate_item['rate']}
+            )
+        self._put_data_to_cache(self.result)
+        return self.result
+
+    def _get_data_from_archive(self) -> Dict:
+        """Private method call cbrf endpoint to get archived rates data."""
+        year, month, day = self.date.split('-')
+        url = CURRENCY_ARCHIVE_URL.format(YEAR=year, MONTH=month, DAY=day)
         request = requests.get(url)
-        request.raise_for_status()
-        raw_data = request.json()
-
-        for currency in self.currencies:
-            if currency in raw_data['Valute']:
-                result['currencies'].append(
-                    {'name': currency, 'rate': raw_data['Valute'][currency]['Value']}
-                )
-        return result
-
-    def _is_date_archive(self, input_date: str) -> bool:
         try:
-            input_date = datetime.strptime(input_date, '%Y-%m-%d').date()
-            current_date = datetime.now().date()
+            request.raise_for_status()
+            raw_data = request.json()
+        except HTTPError as error:
+            if request.status_code == 404:
+                raise DateNotFoundException()
+            raise error
+        return self._prepare_raw_data(raw_data)
+
+    def _is_date_future(self) -> bool:
+        """Private method check if date is future date."""
+        try:
+            input_date: datetime.date = datetime.strptime(self.date, '%Y-%m-%d').date()
+            current_date: datetime.date = datetime.now().date()
+
+            if input_date > current_date:
+                return True
+            return False
+        except ValueError:
+            return False
+
+    def _is_date_archive(self) -> bool:
+        """Private method check if input_date less than current_date."""
+        try:
+            input_date: datetime.date = datetime.strptime(self.date, '%Y-%m-%d').date()
+            current_date: datetime.date = datetime.now().date()
 
             if input_date < current_date:
                 return True
             return False
         except ValueError:
             return False
+
+    def _prepare_raw_data(self, raw_data: Dict) -> Dict:
+        """Private method prepare raw result from cbrf archive."""
+        for currency in self.currencies:
+            if currency in raw_data['Valute']:
+                self.result['currencies'].append(
+                    {'name': currency, 'rate': raw_data['Valute'][currency]['Value']}
+                )
+        return self.result
+
+    def _get_data_from_source(self) -> Dict:
+        """Private method fetch data from cbrf and execute delayed task to save data to db."""
+        url: str = CURRENCY_URL
+        request: Request = requests.get(url)
+
+        request.raise_for_status()
+        raw_data: Dict = request.json()
+
+        return self._prepare_raw_data(raw_data)
+
+    def _get_data_from_cache(self) -> Optional[Dict]:
+        """Private method fetch data from Redis cache."""
+        cached_data = cache.get(self.date)
+        if cached_data:
+            return cached_data
+        return None
+
+    def _put_data_to_cache(self, data: Dict) -> None:
+        """Private method put data to Redis cache."""
+        cache.set(self.date, data)
